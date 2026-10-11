@@ -6,26 +6,73 @@ on:
   push: {branches: [main]}
   workflow_dispatch:
   schedule: [{cron: '23 * * * *'}]
-permissions: {contents: read, pages: write, id-token: write}
+  pull_request:
+permissions: {actions: read, contents: read, pages: write, id-token: write}
 concurrency: {group: pages, cancel-in-progress: false}
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs: {release: '${{ steps.assets.outputs.release }}'}
     steps:
       - uses: actions/checkout@v4
-        with: {repository: skifighting-afk/chuckchuck, ref: main, fetch-depth: 1}
+      - uses: actions/checkout@v4
+        with: {repository: skifighting-afk/chuckchuck, ref: main, fetch-depth: 1, path: source}
       - name: 홈페이지가 아직 main에 없으면 작업 브랜치에서
         run: if [ ! -d site ]; then git fetch --depth 1 origin homepage-brand && git checkout FETCH_HEAD; fi
+        working-directory: source
       - uses: actions/setup-node@v4
         with: {node-version: 22}
+      - name: 공개 파일 보존 회귀 검사
+        run: node scripts/check-home-assets.mjs && node scripts/check-fetch-home-assets.mjs
       - run: node scripts/build-home.mjs --site _site
+        working-directory: source
+      - name: 이번 홈페이지 파일 기록
+        id: assets
+        run: |
+          release=$(node scripts/home-assets.mjs record source/_site)
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+      - name: 마지막 실제 게시 파일 찾기
+        id: previous
+        if: github.event_name != 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: await require('./scripts/fetch-home-assets.cjs')({github,context,core});
+      - name: 이전 두 버전의 홈페이지 파일 유지
+        if: steps.previous.outputs.archive != ''
+        env:
+          PREVIOUS_ARCHIVE: ${{ steps.previous.outputs.archive }}
+          PREVIOUS_FORMAT: ${{ steps.previous.outputs.format }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/previous-unpacked" "$RUNNER_TEMP/previous-home"
+          unzip -q "$PREVIOUS_ARCHIVE" -d "$RUNNER_TEMP/previous-unpacked"
+          if [ "$PREVIOUS_FORMAT" = "pages" ]; then
+            tar -xf "$RUNNER_TEMP/previous-unpacked/artifact.tar" -C "$RUNNER_TEMP/previous-home"
+          else
+            cp -a "$RUNNER_TEMP/previous-unpacked/." "$RUNNER_TEMP/previous-home/"
+          fi
+          node scripts/home-assets.mjs retain "$RUNNER_TEMP/previous-home" source/_site
+      - name: 다음 배포가 유지할 공개 홈페이지 파일
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with: {name: home-assets, path: source/_site, retention-days: 30}
       - uses: actions/configure-pages@v5
+        if: github.event_name != 'pull_request'
       - uses: actions/upload-pages-artifact@v3
-        with: {path: _site}
+        if: github.event_name != 'pull_request'
+        with: {path: source/_site}
   deploy:
     needs: build
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     environment: {name: github-pages, url: '${{ steps.d.outputs.page_url }}'}
     steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: 22}
       - id: d
+        name: 게시 (GitHub Pages)
         uses: actions/deploy-pages@v4
+      - name: 실제 주소에서 이번·이전 파일 무결성 확인
+        env:
+          HOME_RELEASE: ${{ needs.build.outputs.release }}
+        run: node scripts/home-assets.mjs verify https://chukchuksajang.co.kr "$HOME_RELEASE"
